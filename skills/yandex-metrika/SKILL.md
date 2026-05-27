@@ -28,16 +28,19 @@ METRIKA_COUNTER_ID=12345678     # ID счётчика Метрики
 
 ## Запуск
 
-Скрипт лежит внутри плагина — запускать через `${CLAUDE_PLUGIN_ROOT}`:
+Скрипт `metrika.mjs` лежит рядом с этим SKILL.md.
 
+**Если установлен как плагин** (`/plugin install`) — путь через `${CLAUDE_PLUGIN_ROOT}`:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/yandex-metrika/metrika.mjs"                     # весь отчёт, 30 дней
-node "${CLAUDE_PLUGIN_ROOT}/skills/yandex-metrika/metrika.mjs" --days 7
-node "${CLAUDE_PLUGIN_ROOT}/skills/yandex-metrika/metrika.mjs" --report sources
-node "${CLAUDE_PLUGIN_ROOT}/skills/yandex-metrika/metrika.mjs" --report search --days 14
+node "${CLAUDE_PLUGIN_ROOT}/skills/yandex-metrika/metrika.mjs" --report overview --days 30
 ```
 
-Отчёты (`--report`): `overview` | `sources` | `search` | `pages` | `geo` | `all` (дефолт).
+**Если установлен как user-скилл** (симлинк в `~/.claude/skills/`) — `${CLAUDE_PLUGIN_ROOT}` не задан, запускай по пути скилла:
+```bash
+node ~/.claude/skills/yandex-metrika/metrika.mjs --report overview --days 30
+```
+
+Аргументы: `--report overview|sources|search|pages|geo|all` (дефолт `all`) · `--days N` (дефолт 30).
 
 ## Что отдаёт
 
