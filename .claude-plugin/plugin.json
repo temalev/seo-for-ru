@@ -1,0 +1,10 @@
+{
+  "name": "yandex-metrika",
+  "description": "Выгрузка аналитики из Яндекс.Метрики через Stat API: визиты, источники, поисковые запросы, топ страниц, география. Работает в любом проекте — счётчик и токен задаются в .env.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Artem"
+  },
+  "keywords": ["yandex", "metrika", "metrica", "analytics", "seo"],
+  "license": "MIT"
+}

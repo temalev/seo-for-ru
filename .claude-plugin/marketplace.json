@@ -1,0 +1,13 @@
+{
+  "name": "artem-skills",
+  "owner": {
+    "name": "Artem"
+  },
+  "plugins": [
+    {
+      "name": "yandex-metrika",
+      "source": "./",
+      "description": "Выгрузка аналитики из Яндекс.Метрики через Stat API (визиты, источники, запросы, страницы, гео)."
+    }
+  ]
+}
