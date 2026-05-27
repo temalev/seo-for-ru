@@ -1,10 +1,10 @@
 {
-  "name": "yandex-metrika",
-  "description": "Выгрузка аналитики из Яндекс.Метрики через Stat API: визиты, источники, поисковые запросы, топ страниц, география. Работает в любом проекте — счётчик и токен задаются в .env.",
-  "version": "0.1.0",
+  "name": "seo-for-ru",
+  "description": "SEO-инструменты для рунета: Яндекс.Метрика (трафик/источники/запросы), Яндекс.Вебмастер (позиции/CTR/ИКС/индексация/диагностика) и кросс-отчёт позиции×спрос. Чистый Node ≥18, конфиг в .env проекта.",
+  "version": "0.2.0",
   "author": {
     "name": "Artem"
   },
-  "keywords": ["yandex", "metrika", "metrica", "analytics", "seo"],
+  "keywords": ["yandex", "metrika", "metrica", "webmaster", "wordstat", "seo", "analytics", "search-queries", "ru"],
   "license": "MIT"
 }
