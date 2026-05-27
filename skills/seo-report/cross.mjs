@@ -1,26 +1,31 @@
 #!/usr/bin/env node
 /**
  * Кросс-отчёт SEO: запросы Яндекс.Вебмастера (позиции/показы/клики/CTR)
- * × поведение из Яндекс.Метрики (визиты/отказы по тем же запросам).
+ * × спрос из Яндекс.Wordstat (частотность запроса в месяц).
  *
- * Ни Вебмастер, ни Метрика по отдельности так не умеют:
+ * Ни одна сторона по отдельности так не отвечает на вопрос «куда жать»:
  *   - Вебмастер знает, по каким запросам сайт показывается и на какой позиции,
- *     но не знает, что делают пришедшие люди.
- *   - Метрика знает поведение, но Яндекс часто скрывает сами запросы.
- * Здесь мы джойним по тексту запроса и подсвечиваем, что делать.
+ *     но не знает, СКОЛЬКО этот запрос вообще ищут (потенциал трафика).
+ *   - Wordstat знает спрос, но не знает, где ранжируется ваш сайт.
+ * Джойн по нормализованному тексту запроса даёт приоритет: дожимать в топ те
+ * запросы 11–30, у которых высокий спрос — там максимум недобранного трафика.
  *
- * ВАЖНО: Метрика массово прячет поисковые фразы Яндекса. Поэтому данные
- * Метрики — это ОБОГАЩЕНИЕ: actionable-выводы по позициям/CTR работают и без
- * матча, поведение накладывается там, где запрос сошёлся.
+ * Почему не Метрика: Stat API массово прячет поисковые фразы Яндекса и жёстко
+ * троттлит запросы с измерением searchPhrase («too complicated»). Серьёзные
+ * RU-SEO-тулзы фразы из Метрики не тянут — авторитетный источник это Вебмастер,
+ * а спрос берут из Wordstat. Wordstat — обогащение: нет токена/доступа → отчёт
+ * деградирует к чистому Вебмастеру.
  *
- * Конфиг (.env в корне текущего проекта или env-переменные) — нужны ОБА набора:
- *   # Вебмастер
+ * Конфиг (.env в корне текущего проекта или env-переменные):
+ *   # Вебмастер (обязательно)
  *   YANDEX_WEBMASTER_TOKEN — scope webmaster:read (fallback: YANDEX_OAUTH_TOKEN)
  *   WEBMASTER_HOST         — домен для выбора хоста (если их несколько)
- *   # Метрика
- *   YANDEX_METRIKA_TOKEN   — scope metrika:read (fallback: YANDEX_OAUTH_TOKEN)
- *   METRIKA_COUNTER_ID     — ID счётчика
- *   METRIKA_ACCURACY       — точность/семплинг, дефолт 'low'
+ *   # Wordstat (опционально — без него отчёт только по Вебмастеру)
+ *   YANDEX_WORDSTAT_TOKEN  — отдельный токен Wordstat API (Bearer); доступ
+ *                            запрашивается формой внизу wordstat.yandex.ru
+ *   WORDSTAT_REGIONS       — id регионов через запятую (напр. 11=Рязань,
+ *                            213=Москва); пусто = вся Россия
+ *   WORDSTAT_DEVICES       — all|desktop|phone|tablet (дефолт all)
  *
  * Запуск:
  *   node cross.mjs                 # топ-50, свежее окно Вебмастера
@@ -44,11 +49,12 @@ function loadEnv() {
 loadEnv();
 
 const WM_TOKEN = process.env.YANDEX_WEBMASTER_TOKEN || process.env.YANDEX_OAUTH_TOKEN;
-const MT_TOKEN = process.env.YANDEX_METRIKA_TOKEN || process.env.YANDEX_OAUTH_TOKEN;
+const WS_TOKEN = process.env.YANDEX_WORDSTAT_TOKEN; // отдельный доступ, без fallback
 const HOST_FILTER = process.env.WEBMASTER_HOST || '';
-const COUNTER_ID = process.env.METRIKA_COUNTER_ID;
+const WS_REGIONS = (process.env.WORDSTAT_REGIONS || '').split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+const WS_DEVICES = (process.env.WORDSTAT_DEVICES || 'all');
 const WM_BASE = 'https://api.webmaster.yandex.net/v4';
-const MT_API = 'https://api-metrika.yandex.net/stat/v1/data';
+const WS_API = 'https://api.wordstat.yandex.net/v1';
 
 // --- args ---
 const args = process.argv.slice(2);
@@ -59,22 +65,21 @@ const getArg = (name, def) => {
 const days = parseInt(getArg('days', '7'), 10);
 const daysExplicit = args.includes('--days');
 const limit = parseInt(getArg('limit', '50'), 10);
-const order = getArg('order', 'shows'); // shows|clicks|position|ctr
+const order = getArg('order', 'shows'); // shows|clicks|position|ctr|demand
 
 // Пороги эвристик (подсветка действий). Сознательно простые — крутите под себя.
 const NEAR_TOP_MIN = 11, NEAR_TOP_MAX = 30; // «почти в топе» — дожать
 const SNIPPET_POS_MAX = 15;                 // ранжируется неплохо…
 const SNIPPET_CTR_MAX = 0.03;               // …но кликают мало → переписать сниппет
 const SNIPPET_SHOWS_MIN = 50;               // и показов достаточно, чтобы это значило
-const LANDING_VISITS_MIN = 5;               // в Метрике есть заметный трафик…
-const LANDING_BOUNCE_MIN = 50;              // …но отказы высокие → слабая посадочная
+const GAP_POS_MIN = 20;                     // ранжируемся слабо (поз > 20)…
+const GAP_DEMAND_MIN = 300;                 // …при заметном спросе → недобираем трафик
+const WS_MAX_LOOKUPS = 120;                 // потолок обращений к Wordstat за прогон
 
 if (!WM_TOKEN) fail('Не задан YANDEX_WEBMASTER_TOKEN (или YANDEX_OAUTH_TOKEN со scope webmaster:read).');
-if (!MT_TOKEN) fail('Не задан YANDEX_METRIKA_TOKEN (или YANDEX_OAUTH_TOKEN со scope metrika:read).');
-if (!COUNTER_ID) fail('Не задан METRIKA_COUNTER_ID (ID счётчика Метрики).');
 
 function fail(msg) {
-  console.error(`❌ ${msg}\n   См. skills/seo-report/SKILL.md — нужны конфиги обоих скиллов.`);
+  console.error(`❌ ${msg}\n   См. skills/seo-report/SKILL.md — нужен хотя бы токен Вебмастера.`);
   process.exit(1);
 }
 
@@ -157,55 +162,52 @@ async function fetchWmQueries(userId, host) {
   });
 }
 
-// ─── Метрика API ─────────────────────────────────────────────────────────────
-let mtLast = 0;
-async function mtQuery(params, attempt = 0) {
-  const url = new URL(MT_API);
-  url.searchParams.set('ids', COUNTER_ID);
-  url.searchParams.set('date1', fmt(periodFrom));
-  url.searchParams.set('date2', fmt(periodTo));
-  url.searchParams.set('accuracy', process.env.METRIKA_ACCURACY || 'low');
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-
-  const wait = mtLast + 1100 - Date.now(); // Метрика троттлит бурсты под видом 400 "too complicated"
+// ─── Wordstat API ──────────────────────────────────────────────────────────────
+// POST /v1/topRequests, Bearer-токен. Спрос фразы = totalCount (широкое
+// соответствие, показов/мес). Лимит API щедрый (10/с, 1000/день) — троттла как
+// у Метрики нет; пейсим ~150мс и один раз ретраим 429 по Retry-After.
+let wsLast = 0;
+async function wsTopRequests(phrase, retried = false) {
+  const wait = wsLast + 160 - Date.now();
   if (wait > 0) await sleep(wait);
-  mtLast = Date.now();
+  wsLast = Date.now();
 
-  const res = await fetch(url, { headers: { Authorization: `OAuth ${MT_TOKEN}` } });
-  if (res.ok) return res.json();
-  const body = await res.text();
-  // 429 — реальный троттлинг, ретраим. "too complicated" НЕ ретраим: он
-  // детерминирован для данной формы запроса (повтор с теми же параметрами не
-  // спасёт), а каждый отказ стоит ~11с — сервер успевает посчитать тяжёлый
-  // searchPhrase-запрос, прежде чем отклонить. Сразу деградируем к Вебмастеру.
-  if (res.status === 429 && attempt < 3) {
-    await sleep(1500 * (attempt + 1));
-    return mtQuery(params, attempt + 1);
+  const body = { phrases: [phrase], numPhrases: 1, devices: [WS_DEVICES] };
+  if (WS_REGIONS.length) body.regions = WS_REGIONS;
+  const res = await fetch(`${WS_API}/topRequests`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${WS_TOKEN}`, 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(body),
+  });
+  if (res.ok) {
+    const d = await res.json();
+    return typeof d.totalCount === 'number' ? d.totalCount : null;
   }
-  throw new Error(`Metrika ${res.status}: ${body.slice(0, 300)}`);
+  if (res.status === 429 && !retried) {
+    const ra = parseInt(res.headers.get('retry-after') || '', 10);
+    const w = (Number.isFinite(ra) && ra <= 60 ? ra : 2) * 1000 + Math.random() * 1000;
+    await sleep(w);
+    return wsTopRequests(phrase, true);
+  }
+  const txt = await res.text();
+  throw new Error(`Wordstat ${res.status}: ${txt.slice(0, 200)}`);
 }
 
-// Поведение по поисковым фразам: визиты + отказы. Карта normQ → {visits, bounce}.
-async function fetchMtPhrases() {
-  // searchPhrase — высококардинальное измерение; большой limit → 400 "too
-  // complicated". Берём топ-200 фраз по визитам (хватает для матча с запросами).
-  const d = await mtQuery({
-    metrics: 'ym:s:visits,ym:s:bounceRate',
-    dimensions: 'ym:s:searchPhrase',
-    sort: '-ym:s:visits',
-    limit: '200',
-  });
+// Спрос по списку фраз. Возвращает Map normQ → demand. Один запрос на фразу,
+// с потолком WS_MAX_LOOKUPS. Бьётся первая же ошибка (бросаем — caller деградирует).
+async function fetchDemand(phrases) {
   const map = new Map();
-  for (const row of d.data || []) {
-    const phrase = row.dimensions?.[0]?.name;
-    if (!phrase) continue; // строка «не определено» / скрытые запросы
-    map.set(normQ(phrase), { visits: row.metrics[0] || 0, bounce: row.metrics[1] || 0 });
+  const list = phrases.slice(0, WS_MAX_LOOKUPS);
+  for (const p of list) {
+    const demand = await wsTopRequests(p.text);
+    if (demand != null) map.set(p.key, demand);
   }
   return map;
 }
 
 // ─── Сборка ──────────────────────────────────────────────────────────────────
 function sortRows(rows) {
+  if (order === 'demand') return rows.sort((a, b) => (b.demand ?? -1) - (a.demand ?? -1));
   if (order === 'ctr') return rows.sort((a, b) => b.ctr - a.ctr);
   if (order === 'position') return rows.sort((a, b) => (a.pos ?? 999) - (b.pos ?? 999));
   if (order === 'clicks') return rows.sort((a, b) => b.clicks - a.clicks);
@@ -218,65 +220,74 @@ function bucket(label, rows, fmtLine) {
   for (const r of rows) console.log(`    ${fmtLine(r)}`);
 }
 
+// Приоритет дожима: спрос если есть, иначе показы (деградация без Wordstat).
+const potential = (r) => (r.demand != null ? r.demand : r.shows);
+
 try {
   const { userId, host } = await resolveHost();
   const hostName = host.unicode_host_url || host.ascii_host_url;
-  console.log(`Host: ${hostName}  ·  Counter: ${COUNTER_ID}  ·  ${periodLabel}`);
-
-  // Метрику тянем мягко: если фразы скрыты/ошибка — продолжаем без неё.
-  let phrases = new Map();
-  let mtNote = '';
-  try {
-    phrases = await fetchMtPhrases();
-    if (!phrases.size) mtNote = 'Метрика не вернула поисковых фраз (Яндекс их скрывает) — поведение недоступно.';
-  } catch (e) {
-    mtNote = `Метрика недоступна (${e.message.split('\n')[0]}) — отчёт только по Вебмастеру.`;
-  }
+  const regLabel = WS_REGIONS.length ? `регионы ${WS_REGIONS.join(',')}` : 'вся Россия';
+  console.log(`Host: ${hostName}  ·  Wordstat: ${WS_TOKEN ? regLabel : 'нет токена'}  ·  ${periodLabel}`);
 
   const wmRows = await fetchWmQueries(userId, host);
   if (!wmRows.length) { console.log('\n  (Вебмастер не вернул запросов за период)\n'); process.exit(0); }
 
-  // Джойн: к каждому запросу Вебмастера цепляем поведение из Метрики, если сошлось.
-  let matched = 0;
-  for (const r of wmRows) {
-    const m = phrases.get(r.key);
-    if (m) { r.visits = m.visits; r.bounce = m.bounce; matched++; }
-  }
-
   const shown = sortRows([...wmRows]).slice(0, limit);
 
-  section(`Запросы × поведение (топ-${limit}, сортировка: ${order})`);
-  console.log(`  матч с Метрикой: ${matched} из ${wmRows.length} запросов` + (mtNote ? ` · ${mtNote}` : ''));
+  // Wordstat — мягко: нет токена/ошибка → продолжаем без спроса.
+  let wsNote = WS_TOKEN ? '' : 'нет YANDEX_WORDSTAT_TOKEN — спрос недоступен, отчёт по Вебмастеру.';
+  let demandMap = new Map();
+  if (WS_TOKEN) {
+    // Обогащаем то, что покажем + кандидатов на дожим (поз 11–30) — там спрос решает.
+    const nearTop = wmRows.filter((r) => r.pos != null && r.pos >= NEAR_TOP_MIN && r.pos <= NEAR_TOP_MAX);
+    const seen = new Set();
+    const toLookup = [...shown, ...nearTop].filter((r) => (seen.has(r.key) ? false : seen.add(r.key)));
+    try {
+      demandMap = await fetchDemand(toLookup);
+      for (const r of wmRows) if (demandMap.has(r.key)) r.demand = demandMap.get(r.key);
+      if (!demandMap.size) wsNote = 'Wordstat не вернул спроса по запросам.';
+    } catch (e) {
+      wsNote = `Wordstat недоступен (${e.message.split('\n')[0]}) — отчёт по Вебмастеру.`;
+    }
+  }
+
+  // Пересортировка с учётом спроса, если просили --order demand (демонд уже проставлен).
+  const shownFinal = order === 'demand' ? sortRows([...wmRows]).slice(0, limit) : shown;
+
+  section(`Запросы × спрос (топ-${limit}, сортировка: ${order})`);
+  if (wsNote) console.log(`  ${wsNote}`);
   console.log('');
-  console.log(`  ${'запрос'.padEnd(38)} ${'показы'.padStart(7)} ${'клики'.padStart(6)} ${'CTR'.padStart(6)} ${'поз.'.padStart(5)} ${'виз.М'.padStart(6)} ${'отказы'.padStart(7)}`);
-  for (const r of shown) {
+  console.log(`  ${'запрос'.padEnd(38)} ${'показы'.padStart(7)} ${'клики'.padStart(6)} ${'CTR'.padStart(6)} ${'поз.'.padStart(5)} ${'спрос/мес'.padStart(10)}`);
+  for (const r of shownFinal) {
     const pos = r.pos != null ? r.pos.toFixed(1) : '—';
-    const v = r.visits != null ? num(r.visits) : '·';
-    const b = r.bounce != null ? `${r.bounce.toFixed(0)}%` : '·';
-    console.log(`  ${r.text.slice(0, 38).padEnd(38)} ${num(r.shows).padStart(7)} ${num(r.clicks).padStart(6)} ${pct(Math.min(r.ctr, 1)).padStart(6)} ${String(pos).padStart(5)} ${v.padStart(6)} ${b.padStart(7)}`);
+    const dem = r.demand != null ? num(r.demand) : '·';
+    console.log(`  ${r.text.slice(0, 38).padEnd(38)} ${num(r.shows).padStart(7)} ${num(r.clicks).padStart(6)} ${pct(Math.min(r.ctr, 1)).padStart(6)} ${String(pos).padStart(5)} ${dem.padStart(10)}`);
   }
 
   // ─── Действия ───
   section('Что делать');
 
+  // 🎯 Дожать в топ: позиция 11–30, приоритет по спросу (или показам без Wordstat).
   const nearTop = wmRows
     .filter((r) => r.pos != null && r.pos >= NEAR_TOP_MIN && r.pos <= NEAR_TOP_MAX)
-    .sort((a, b) => b.shows - a.shows).slice(0, 10);
-  bucket(`🎯 Дожать в топ (позиция ${NEAR_TOP_MIN}–${NEAR_TOP_MAX}) — контент/перелинковка:`, nearTop,
-    (r) => `${r.text.slice(0, 48).padEnd(48)} поз ${r.pos.toFixed(1).padStart(4)}  показы ${num(r.shows)}`);
+    .sort((a, b) => potential(b) - potential(a)).slice(0, 10);
+  bucket(`🎯 Дожать в топ (позиция ${NEAR_TOP_MIN}–${NEAR_TOP_MAX}) — приоритет по спросу:`, nearTop,
+    (r) => `${r.text.slice(0, 44).padEnd(44)} поз ${r.pos.toFixed(1).padStart(4)}  спрос ${(r.demand != null ? num(r.demand) : '·').padStart(7)}  показы ${num(r.shows)}`);
 
+  // ✏️ Переписать сниппет: ранжируется, но кликают мало.
   const snippet = wmRows
     .filter((r) => r.pos != null && r.pos <= SNIPPET_POS_MAX && r.ctr < SNIPPET_CTR_MAX && r.shows >= SNIPPET_SHOWS_MIN)
-    .sort((a, b) => b.shows - a.shows).slice(0, 10);
+    .sort((a, b) => potential(b) - potential(a)).slice(0, 10);
   bucket(`✏️  Переписать title/description (ранжируется, но мало кликов):`, snippet,
-    (r) => `${r.text.slice(0, 48).padEnd(48)} CTR ${pct(r.ctr).padStart(5)}  поз ${r.pos.toFixed(1)}  показы ${num(r.shows)}`);
+    (r) => `${r.text.slice(0, 44).padEnd(44)} CTR ${pct(r.ctr).padStart(5)}  поз ${r.pos.toFixed(1)}  спрос ${(r.demand != null ? num(r.demand) : '·')}`);
 
-  if (matched) {
-    const landing = wmRows
-      .filter((r) => r.visits != null && r.visits >= LANDING_VISITS_MIN && r.bounce >= LANDING_BOUNCE_MIN)
-      .sort((a, b) => b.visits - a.visits).slice(0, 10);
-    bucket(`🚧 Слабая посадочная (трафик есть, но отказы высокие):`, landing,
-      (r) => `${r.text.slice(0, 48).padEnd(48)} визиты ${num(r.visits)}  отказы ${r.bounce.toFixed(0)}%`);
+  // 💎 Высокий спрос, слабая видимость (только при наличии данных Wordstat).
+  if (demandMap.size) {
+    const gap = wmRows
+      .filter((r) => r.demand != null && r.demand >= GAP_DEMAND_MIN && r.pos != null && r.pos > GAP_POS_MIN)
+      .sort((a, b) => b.demand - a.demand).slice(0, 10);
+    bucket(`💎 Высокий спрос — слабая видимость (поз > ${GAP_POS_MIN}): новый контент/страница:`, gap,
+      (r) => `${r.text.slice(0, 44).padEnd(44)} спрос ${num(r.demand).padStart(7)}  поз ${r.pos.toFixed(1)}  показы ${num(r.shows)}`);
   }
 
   console.log('');
