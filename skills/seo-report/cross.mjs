@@ -20,12 +20,17 @@
  *   # Вебмастер (обязательно)
  *   YANDEX_WEBMASTER_TOKEN — scope webmaster:read (fallback: YANDEX_OAUTH_TOKEN)
  *   WEBMASTER_HOST         — домен для выбора хоста (если их несколько)
- *   # Wordstat (опционально — без него отчёт только по Вебмастеру)
- *   YANDEX_WORDSTAT_TOKEN  — отдельный токен Wordstat API (Bearer); доступ
- *                            запрашивается формой внизу wordstat.yandex.ru
+ *   # Wordstat (опционально — без него отчёт только по Вебмастеру).
+ *   # Два равноценных по данным варианта доступа, берётся первый доступный:
+ *   #   A) прямой Wordstat API (OAuth, форма разблокировки на wordstat.yandex.ru):
+ *   YANDEX_WORDSTAT_TOKEN  — Bearer-токен Wordstat API
+ *   #   B) Yandex Cloud Search API (API-ключ AI Studio + folderId; Preview, платный):
+ *   YANDEX_CLOUD_API_KEY   — ключ AI Studio (или YC_API_KEY)
+ *   YANDEX_CLOUD_FOLDER_ID — id каталога Cloud (или YC_FOLDER_ID)
+ *   # Общее:
  *   WORDSTAT_REGIONS       — id регионов через запятую (напр. 11=Рязань,
  *                            213=Москва); пусто = вся Россия
- *   WORDSTAT_DEVICES       — all|desktop|phone|tablet (дефолт all)
+ *   WORDSTAT_DEVICES       — all|desktop|phone|tablet (дефолт all; только для A)
  *
  * Запуск:
  *   node cross.mjs                 # топ-50, свежее окно Вебмастера
@@ -49,12 +54,17 @@ function loadEnv() {
 loadEnv();
 
 const WM_TOKEN = process.env.YANDEX_WEBMASTER_TOKEN || process.env.YANDEX_OAUTH_TOKEN;
-const WS_TOKEN = process.env.YANDEX_WORDSTAT_TOKEN; // отдельный доступ, без fallback
+// Wordstat: два варианта доступа (равноценны по данным). oauth приоритетнее.
+const WS_OAUTH = process.env.YANDEX_WORDSTAT_TOKEN;
+const YC_KEY = process.env.YANDEX_CLOUD_API_KEY || process.env.YC_API_KEY;
+const YC_FOLDER = process.env.YANDEX_CLOUD_FOLDER_ID || process.env.YC_FOLDER_ID;
+const WS_MODE = WS_OAUTH ? 'oauth' : (YC_KEY && YC_FOLDER ? 'cloud' : null);
 const HOST_FILTER = process.env.WEBMASTER_HOST || '';
 const WS_REGIONS = (process.env.WORDSTAT_REGIONS || '').split(',').map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
 const WS_DEVICES = (process.env.WORDSTAT_DEVICES || 'all');
 const WM_BASE = 'https://api.webmaster.yandex.net/v4';
-const WS_API = 'https://api.wordstat.yandex.net/v1';
+const WS_OAUTH_API = 'https://api.wordstat.yandex.net/v1/topRequests';
+const WS_CLOUD_API = 'https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests';
 
 // --- args ---
 const args = process.argv.slice(2);
@@ -163,25 +173,33 @@ async function fetchWmQueries(userId, host) {
 }
 
 // ─── Wordstat API ──────────────────────────────────────────────────────────────
-// POST /v1/topRequests, Bearer-токен. Спрос фразы = totalCount (широкое
-// соответствие, показов/мес). Лимит API щедрый (10/с, 1000/день) — троттла как
-// у Метрики нет; пейсим ~150мс и один раз ретраим 429 по Retry-After.
+// topRequests: спрос фразы = totalCount (широкое соответствие, показов/мес).
+// Два режима с почти одинаковым телом: A (oauth) — phrases[] + Bearer; B (cloud)
+// — phrase + folderId + Api-Key. totalCount в Cloud приходит строкой → Number().
+// Лимит щедрый (троттла как у Метрики нет): пейсим ~160мс, один ретрай 429.
 let wsLast = 0;
 async function wsTopRequests(phrase, retried = false) {
   const wait = wsLast + 160 - Date.now();
   if (wait > 0) await sleep(wait);
   wsLast = Date.now();
 
-  const body = { phrases: [phrase], numPhrases: 1, devices: [WS_DEVICES] };
-  if (WS_REGIONS.length) body.regions = WS_REGIONS;
-  const res = await fetch(`${WS_API}/topRequests`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${WS_TOKEN}`, 'Content-Type': 'application/json; charset=utf-8' },
-    body: JSON.stringify(body),
-  });
+  let url, headers, body;
+  if (WS_MODE === 'cloud') {
+    url = WS_CLOUD_API;
+    headers = { Authorization: `Api-Key ${YC_KEY}`, 'Content-Type': 'application/json' };
+    body = { phrase, numPhrases: 1, folderId: YC_FOLDER };
+    if (WS_REGIONS.length) body.regions = WS_REGIONS;
+  } else {
+    url = WS_OAUTH_API;
+    headers = { Authorization: `Bearer ${WS_OAUTH}`, 'Content-Type': 'application/json; charset=utf-8' };
+    body = { phrases: [phrase], numPhrases: 1, devices: [WS_DEVICES] };
+    if (WS_REGIONS.length) body.regions = WS_REGIONS;
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
   if (res.ok) {
     const d = await res.json();
-    return typeof d.totalCount === 'number' ? d.totalCount : null;
+    const tc = Number(d.totalCount);
+    return Number.isFinite(tc) ? tc : null;
   }
   if (res.status === 429 && !retried) {
     const ra = parseInt(res.headers.get('retry-after') || '', 10);
@@ -227,17 +245,18 @@ try {
   const { userId, host } = await resolveHost();
   const hostName = host.unicode_host_url || host.ascii_host_url;
   const regLabel = WS_REGIONS.length ? `регионы ${WS_REGIONS.join(',')}` : 'вся Россия';
-  console.log(`Host: ${hostName}  ·  Wordstat: ${WS_TOKEN ? regLabel : 'нет токена'}  ·  ${periodLabel}`);
+  const wsLabel = WS_MODE ? `${WS_MODE === 'cloud' ? 'Cloud, ' : ''}${regLabel}` : 'нет доступа';
+  console.log(`Host: ${hostName}  ·  Wordstat: ${wsLabel}  ·  ${periodLabel}`);
 
   const wmRows = await fetchWmQueries(userId, host);
   if (!wmRows.length) { console.log('\n  (Вебмастер не вернул запросов за период)\n'); process.exit(0); }
 
   const shown = sortRows([...wmRows]).slice(0, limit);
 
-  // Wordstat — мягко: нет токена/ошибка → продолжаем без спроса.
-  let wsNote = WS_TOKEN ? '' : 'нет YANDEX_WORDSTAT_TOKEN — спрос недоступен, отчёт по Вебмастеру.';
+  // Wordstat — мягко: нет доступа/ошибка → продолжаем без спроса.
+  let wsNote = WS_MODE ? '' : 'нет доступа к Wordstat (YANDEX_WORDSTAT_TOKEN либо YANDEX_CLOUD_API_KEY+FOLDER_ID) — спрос недоступен, отчёт по Вебмастеру.';
   let demandMap = new Map();
-  if (WS_TOKEN) {
+  if (WS_MODE) {
     // Обогащаем то, что покажем + кандидатов на дожим (поз 11–30) — там спрос решает.
     const nearTop = wmRows.filter((r) => r.pos != null && r.pos >= NEAR_TOP_MIN && r.pos <= NEAR_TOP_MAX);
     const seen = new Set();
