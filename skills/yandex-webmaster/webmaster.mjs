@@ -44,6 +44,7 @@ const getArg = (name, def) => {
   return i !== -1 && args[i + 1] ? args[i + 1] : def;
 };
 const days = parseInt(getArg('days', '7'), 10);
+const daysExplicit = args.includes('--days');
 const limit = parseInt(getArg('limit', '50'), 10);
 const report = getArg('report', 'all'); // summary|queries|indexing|diagnostics|all
 const order = getArg('order', 'shows'); // shows|clicks|position|ctr
@@ -112,6 +113,12 @@ async function resolveHost() {
   } else {
     throw new Error(`Несколько хостов — задайте WEBMASTER_HOST в .env. Доступные:\n${verified.map((h) => `  - ${h.unicode_host_url || h.ascii_host_url}`).join('\n')}`);
   }
+
+  // Следуем главному зеркалу (напр. www → без www): данные поиска у него.
+  const mainId = host.main_mirror?.host_id;
+  if (mainId && mainId !== host.host_id) {
+    host = hosts.find((h) => h.host_id === mainId) || { ...host, host_id: mainId };
+  }
   return { userId, host };
 }
 
@@ -128,36 +135,40 @@ async function summary(userId, host) {
 }
 
 async function queries(userId, host) {
-  section(`Поисковые запросы (топ-${limit}, ${fmt(date1)} → ${fmt(date2)})`);
-  const indicators = ['TOTAL_SHOWS', 'TOTAL_CLICKS', 'AVG_SHOW_POSITION', 'AVG_CLICK_POSITION'];
-  const orderMap = { shows: 'TOTAL_SHOWS', clicks: 'TOTAL_CLICKS', position: 'AVG_SHOW_POSITION', ctr: 'TOTAL_CLICKS' };
-  const d = await api(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/search-queries/popular`, {
-    order_by: orderMap[order] || 'TOTAL_SHOWS',
-    query_indicator: indicators,
-    date_from: fmt(date1),
-    date_to: fmt(date2),
-    limit,
-  });
-  const rows = (d.queries || []).map((q) => {
+  // order_by у API принимает только TOTAL_SHOWS|TOTAL_CLICKS — остальное сортируем клиентом.
+  const params = {
+    order_by: order === 'clicks' || order === 'ctr' ? 'TOTAL_CLICKS' : 'TOTAL_SHOWS',
+    query_indicator: ['TOTAL_SHOWS', 'TOTAL_CLICKS', 'AVG_SHOW_POSITION', 'AVG_CLICK_POSITION'],
+  };
+  // По умолчанию — без дат (API отдаёт свежее доступное окно). При --days
+  // конец сдвигаем на 2 дня назад: последние дни Вебмастер ещё не обработал.
+  let label = 'свежее окно Вебмастера';
+  if (daysExplicit) {
+    const to = new Date(Date.now() - 2 * 86400_000);
+    const from = new Date(to.getTime() - days * 86400_000);
+    params.date_from = fmt(from);
+    params.date_to = fmt(to);
+    label = `${fmt(from)} → ${fmt(to)}`;
+  }
+  section(`Поисковые запросы (топ-${limit}, ${label})`);
+
+  const d = await api(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/search-queries/popular`, params);
+  let rows = (d.queries || []).map((q) => {
     const ind = q.indicators || {};
     const shows = ind.TOTAL_SHOWS || 0;
     const clicks = ind.TOTAL_CLICKS || 0;
-    return {
-      text: q.query_text || q.query_id || '—',
-      shows,
-      clicks,
-      ctr: shows ? clicks / shows : 0,
-      pos: ind.AVG_SHOW_POSITION,
-    };
+    return { text: q.query_text || q.query_id || '—', shows, clicks, ctr: shows ? clicks / shows : 0, pos: ind.AVG_SHOW_POSITION };
   });
   if (order === 'ctr') rows.sort((a, b) => b.ctr - a.ctr);
+  else if (order === 'position') rows.sort((a, b) => (a.pos ?? 999) - (b.pos ?? 999));
+  rows = rows.slice(0, limit);
 
-  console.log(`  ${'запрос'.padEnd(38)} ${'показы'.padStart(8)} ${'клики'.padStart(7)} ${'CTR'.padStart(7)} ${'поз.'.padStart(6)}`);
+  console.log(`  ${'запрос'.padEnd(40)} ${'показы'.padStart(7)} ${'клики'.padStart(6)} ${'CTR'.padStart(7)} ${'поз.'.padStart(6)}`);
   for (const r of rows) {
     const pos = r.pos != null ? r.pos.toFixed(1) : '—';
-    console.log(`  ${r.text.slice(0, 38).padEnd(38)} ${num(r.shows).padStart(8)} ${num(r.clicks).padStart(7)} ${pct(r.ctr).padStart(7)} ${String(pos).padStart(6)}`);
+    console.log(`  ${r.text.slice(0, 40).padEnd(40)} ${num(r.shows).padStart(7)} ${num(r.clicks).padStart(6)} ${pct(r.ctr).padStart(7)} ${String(pos).padStart(6)}`);
   }
-  if (!rows.length) console.log('  (нет данных за период)');
+  if (!rows.length) console.log('  (нет данных)');
 }
 
 async function indexing(userId, host) {
@@ -178,11 +189,17 @@ async function indexing(userId, host) {
 
 async function diagnostics(userId, host) {
   section('Диагностика сайта');
-  const d = await api(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/diagnostics`);
-  const problems = (d.problems || []).filter((p) => p.state !== 'NONE');
-  if (!problems.length) { console.log('  Проблем не найдено ✓'); return; }
-  for (const p of problems) {
-    console.log(`  [${p.severity || p.state || '—'}] ${p.short_description || p.problem_type || JSON.stringify(p).slice(0, 80)}`);
+  const d = await api(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/diagnostics/`);
+  // problems — объект { TYPE: { severity, state, last_state_update } }.
+  // state ABSENT/NONE = проблемы нет; показываем только присутствующие.
+  const entries = Object.entries(d.problems || {});
+  const present = entries.filter(([, p]) => p && !['ABSENT', 'NONE'].includes(p.state));
+  if (!present.length) {
+    console.log(`  Активных проблем нет ✓ (проверено типов: ${entries.length})`);
+    return;
+  }
+  for (const [type, p] of present) {
+    console.log(`  [${p.severity || '—'} / ${p.state}] ${type}`);
   }
 }
 
