@@ -7,16 +7,14 @@
 В любом проекте, открытом в Claude Code:
 
 ```
-/plugin marketplace add temalev/yandex-metrika-plugin
+/plugin marketplace add temalev/seo-for-ru
 /plugin install yandex-metrika@artem-skills
 ```
-
-> Замените `temalev/yandex-metrika-plugin` на реальный `owner/repo`, когда зальёте на GitHub.
 
 Для локальной разработки плагина:
 
 ```
-claude --plugin-dir /путь/к/yandex-metrika-plugin
+claude --plugin-dir /путь/к/seo-for-ru
 ```
 
 ## Настройка
@@ -69,7 +67,7 @@ Stat API периодически возвращает `400 "Query is too compli
 ## Структура
 
 ```
-yandex-metrika-plugin/
+seo-for-ru/
 ├── .claude-plugin/
 │   ├── plugin.json         # манифест плагина
 │   └── marketplace.json    # каталог для /plugin marketplace add
