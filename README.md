@@ -8,7 +8,7 @@
 
 ```
 /plugin marketplace add temalev/seo-for-ru
-/plugin install yandex-metrika@artem-skills
+/plugin install yandex-metrika@seo-for-ru
 ```
 
 Для локальной разработки плагина:
