@@ -174,7 +174,11 @@ async function mtQuery(params, attempt = 0) {
   const res = await fetch(url, { headers: { Authorization: `OAuth ${MT_TOKEN}` } });
   if (res.ok) return res.json();
   const body = await res.text();
-  if ((body.includes('too complicated') || res.status === 429) && attempt < 8) {
+  // 429 — реальный троттлинг, ретраим. "too complicated" НЕ ретраим: он
+  // детерминирован для данной формы запроса (повтор с теми же параметрами не
+  // спасёт), а каждый отказ стоит ~11с — сервер успевает посчитать тяжёлый
+  // searchPhrase-запрос, прежде чем отклонить. Сразу деградируем к Вебмастеру.
+  if (res.status === 429 && attempt < 3) {
     await sleep(1500 * (attempt + 1));
     return mtQuery(params, attempt + 1);
   }
