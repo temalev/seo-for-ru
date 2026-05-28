@@ -83,6 +83,7 @@ const days = parseInt(getArg('days', '7'), 10);
 const daysExplicit = args.includes('--days');
 const limit = parseInt(getArg('limit', '50'), 10);
 const order = getArg('order', 'shows'); // shows|clicks|position|ctr|demand|visits
+const noFilter = args.includes('--no-filter'); // выключить эвристику накрутки
 
 // Пороги эвристик (подсветка действий). Сознательно простые — крутите под себя.
 const NEAR_TOP_MIN = 11, NEAR_TOP_MAX = 30; // «почти в топе» — дожать
@@ -94,6 +95,12 @@ const GAP_DEMAND_MIN = 300;                 // …при заметном спр
 const LANDING_VISITS_MIN = 5;               // в Метрике есть заметный трафик по фразе…
 const LANDING_BOUNCE_MIN = 50;              // …но отказы высокие → слабая посадочная
 const WS_MAX_LOOKUPS = 120;                 // потолок обращений к Wordstat за прогон
+// Спам/накрутка: три простые эвристики (см. isLikelySpam). Отключается --no-filter.
+const SPAM_TOP_POS = 12;                    // первая страница + 0 кликов при показах ≥ 3 → аномалия
+const SPAM_SHOWS_MIN = 3;
+const SPAM_GLUED_MIN = 14;                  // одно слитное кирил. слово ≥ 14 букв
+const SPAM_BLOCK_RE = process.env.SEO_BLOCKLIST ? new RegExp(process.env.SEO_BLOCKLIST, 'i') : null;
+const SPAM_GLUED_RE = new RegExp(`^[а-я]{${SPAM_GLUED_MIN},}$`, 'i');
 
 if (!WM_TOKEN) fail('Не задан YANDEX_WEBMASTER_TOKEN (или YANDEX_OAUTH_TOKEN со scope webmaster:read).');
 
@@ -110,6 +117,18 @@ const section = (t) => console.log(`\n${'─'.repeat(80)}\n  ${t}\n${'─'.repea
 
 // Нормализация текста запроса для джойна: регистр, пробелы, ё→е.
 const normQ = (s) => (s || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+
+// Эвристика накрутки. Возвращает причину или null.
+//   blocklist     — попадание под SEO_BLOCKLIST из .env (regex)
+//   top-no-clicks — позиция ≤ 10 + показов ≥ 3 + 0 кликов: на топе так не бывает
+//   glued         — слитная опечатка ≥ 14 кирил. без пробелов + 0 кликов
+function isLikelySpam(r) {
+  const t = (r.text || '').trim();
+  if (SPAM_BLOCK_RE && SPAM_BLOCK_RE.test(t)) return 'blocklist';
+  if (r.pos != null && r.pos <= SPAM_TOP_POS && r.shows >= SPAM_SHOWS_MIN && r.clicks === 0) return 'top-no-clicks';
+  if (SPAM_GLUED_RE.test(t) && r.clicks === 0 && r.shows >= 2) return 'glued';
+  return null;
+}
 
 // Период. По умолчанию Вебмастеру дат не даём (он сам отдаёт свежее окно).
 // При --days конец сдвигаем на -2 дня: последние дни Вебмастер ещё не обработал.
@@ -299,8 +318,21 @@ try {
   const mtLabel = MT_MODE ? `счётчик ${MT_COUNTER}` : 'нет';
   console.log(`Host: ${hostName}  ·  Метрика: ${mtLabel}  ·  Wordstat: ${wsLabel}  ·  ${periodLabel}`);
 
-  const wmRows = await fetchWmQueries(userId, host);
+  let wmRows = await fetchWmQueries(userId, host);
   if (!wmRows.length) { console.log('\n  (Вебмастер не вернул запросов за период)\n'); process.exit(0); }
+
+  // Спам-фильтр: отделяем подозрение на накрутку, чтобы оно не засоряло таблицу
+  // и бакеты. Скрытое не молчим — печатаем сводный 🚫-бакет ниже.
+  const spamRows = [];
+  if (!noFilter) {
+    const clean = [];
+    for (const r of wmRows) {
+      const reason = isLikelySpam(r);
+      if (reason) { r._spamReason = reason; spamRows.push(r); }
+      else clean.push(r);
+    }
+    wmRows = clean;
+  }
 
   // Метрика — мягко: один запрос, на ошибке (включая "too complicated") деградируем.
   let mtNote = MT_MODE ? '' : 'нет YANDEX_METRIKA_TOKEN/METRIKA_COUNTER_ID — поведение недоступно.';
@@ -343,6 +375,7 @@ try {
   section(`Запросы × спрос × поведение (топ-${limit}, сортировка: ${order})`);
   if (mtNote) console.log(`  ⚐ ${mtNote}`);
   if (wsNote) console.log(`  ⚐ ${wsNote}`);
+  if (spamRows.length) console.log(`  🚫 скрыто ${spamRows.length} подозрительных (накрутка) — --no-filter, чтобы показать.`);
   console.log('');
   console.log(`  ${'запрос'.padEnd(34)} ${'показы'.padStart(6)} ${'клики'.padStart(5)} ${'CTR'.padStart(6)} ${'поз.'.padStart(5)} ${'спрос'.padStart(8)} ${'виз.М'.padStart(6)} ${'отказы'.padStart(7)}`);
   for (const r of shownFinal) {
@@ -386,6 +419,16 @@ try {
       .sort((a, b) => b.visits - a.visits).slice(0, 10);
     bucket(`🚧 Слабая посадочная (трафик есть, отказы ≥ ${LANDING_BOUNCE_MIN}%): чинить страницу/интент:`, landing,
       (r) => `${r.text.slice(0, 40).padEnd(40)} визиты ${num(r.visits).padStart(4)}  отказы ${r.bounce.toFixed(0)}%  поз ${r.pos != null ? r.pos.toFixed(1) : '—'}`);
+  }
+
+  // 🚫 Похоже на накрутку: что мы отфильтровали — топ-5 по показам + причина.
+  if (spamRows.length) {
+    const sample = [...spamRows].sort((a, b) => b.shows - a.shows).slice(0, 5);
+    console.log(`\n  🚫 Похоже на накрутку (всего ${spamRows.length}; топ-${sample.length}):`);
+    for (const r of sample) {
+      const pos = r.pos != null ? r.pos.toFixed(1) : '—';
+      console.log(`    ${r.text.slice(0, 40).padEnd(40)} показы ${num(r.shows).padStart(5)}  клики ${num(r.clicks).padStart(3)}  поз ${pos.padStart(4)}  [${r._spamReason}]`);
+    }
   }
 
   console.log('');

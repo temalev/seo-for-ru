@@ -48,6 +48,21 @@ const daysExplicit = args.includes('--days');
 const limit = parseInt(getArg('limit', '50'), 10);
 const report = getArg('report', 'all'); // summary|queries|indexing|diagnostics|all
 const order = getArg('order', 'shows'); // shows|clicks|position|ctr
+const noFilter = args.includes('--no-filter'); // выключить эвристику накрутки
+
+// Спам/накрутка: три простые эвристики. Выключается --no-filter.
+const SPAM_TOP_POS = 12;
+const SPAM_SHOWS_MIN = 3;
+const SPAM_GLUED_MIN = 14;
+const SPAM_BLOCK_RE = process.env.SEO_BLOCKLIST ? new RegExp(process.env.SEO_BLOCKLIST, 'i') : null;
+const SPAM_GLUED_RE = new RegExp(`^[а-я]{${SPAM_GLUED_MIN},}$`, 'i');
+function isLikelySpam(r) {
+  const t = (r.text || '').trim();
+  if (SPAM_BLOCK_RE && SPAM_BLOCK_RE.test(t)) return 'blocklist';
+  if (r.pos != null && r.pos <= SPAM_TOP_POS && r.shows >= SPAM_SHOWS_MIN && r.clicks === 0) return 'top-no-clicks';
+  if (SPAM_GLUED_RE.test(t) && r.clicks === 0 && r.shows >= 2) return 'glued';
+  return null;
+}
 
 if (!TOKEN) {
   console.error('❌ Не задан YANDEX_WEBMASTER_TOKEN (или YANDEX_OAUTH_TOKEN).');
@@ -161,14 +176,37 @@ async function queries(userId, host) {
   });
   if (order === 'ctr') rows.sort((a, b) => b.ctr - a.ctr);
   else if (order === 'position') rows.sort((a, b) => (a.pos ?? 999) - (b.pos ?? 999));
+
+  // Спам-фильтр: накрутку держим отдельно от основной таблицы, печатаем
+  // сводным 🚫-блоком ниже.
+  const spam = [];
+  if (!noFilter) {
+    const clean = [];
+    for (const r of rows) {
+      const reason = isLikelySpam(r);
+      if (reason) { r._spamReason = reason; spam.push(r); }
+      else clean.push(r);
+    }
+    rows = clean;
+  }
   rows = rows.slice(0, limit);
 
+  if (spam.length) console.log(`  🚫 скрыто ${spam.length} подозрительных (накрутка) — --no-filter, чтобы показать.`);
   console.log(`  ${'запрос'.padEnd(40)} ${'показы'.padStart(7)} ${'клики'.padStart(6)} ${'CTR'.padStart(7)} ${'поз.'.padStart(6)}`);
   for (const r of rows) {
     const pos = r.pos != null ? r.pos.toFixed(1) : '—';
     console.log(`  ${r.text.slice(0, 40).padEnd(40)} ${num(r.shows).padStart(7)} ${num(r.clicks).padStart(6)} ${pct(r.ctr).padStart(7)} ${String(pos).padStart(6)}`);
   }
   if (!rows.length) console.log('  (нет данных)');
+
+  if (spam.length) {
+    const sample = [...spam].sort((a, b) => b.shows - a.shows).slice(0, 5);
+    console.log(`\n  🚫 Похоже на накрутку (всего ${spam.length}; топ-${sample.length}):`);
+    for (const r of sample) {
+      const pos = r.pos != null ? r.pos.toFixed(1) : '—';
+      console.log(`    ${r.text.slice(0, 40).padEnd(40)} показы ${num(r.shows).padStart(5)}  клики ${num(r.clicks).padStart(3)}  поз ${pos.padStart(4)}  [${r._spamReason}]`);
+    }
+  }
 }
 
 async function indexing(userId, host) {
