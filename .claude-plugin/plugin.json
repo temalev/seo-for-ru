@@ -1,10 +1,10 @@
 {
   "name": "seo-for-ru",
-  "description": "SEO-инструменты для рунета: Яндекс.Метрика (трафик/источники/запросы), Яндекс.Вебмастер (позиции/CTR/ИКС/индексация/диагностика) и кросс-отчёт позиции×спрос. Чистый Node ≥18, конфиг в .env проекта.",
-  "version": "0.2.0",
+  "description": "SEO-инструменты для рунета: Яндекс.Метрика (трафик/источники/запросы), Яндекс.Вебмастер (позиции/CTR/ИКС/индексация/диагностика), кросс-отчёт с трекингом во времени и Google PageSpeed Insights (Core Web Vitals). Чистый Node ≥18, конфиг в .env проекта.",
+  "version": "0.3.0",
   "author": {
     "name": "Artem"
   },
-  "keywords": ["yandex", "metrika", "metrica", "webmaster", "wordstat", "seo", "analytics", "search-queries", "ru"],
+  "keywords": ["yandex", "metrika", "metrica", "webmaster", "wordstat", "pagespeed", "core-web-vitals", "lighthouse", "seo", "analytics", "search-queries", "ru"],
   "license": "MIT"
 }
