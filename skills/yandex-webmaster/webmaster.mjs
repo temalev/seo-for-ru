@@ -237,8 +237,20 @@ async function diagnostics(userId, host) {
     return;
   }
   for (const [type, p] of present) {
-    console.log(`  [${p.severity || '—'} / ${p.state}] ${type}`);
+    console.log(`  [${p.severity || '—'} / ${p.state}, ${freshnessLabel(p.last_state_update)}] ${type}`);
   }
+}
+
+// «N дн назад» / «N ч назад» / «не проверялось». Помогает отличить свежий
+// PRESENT (реально проблема сейчас) от устаревшего PRESENT (мог быть решён,
+// Яндекс просто не пере-проверял) и UNDEFINED без даты.
+function freshnessLabel(iso) {
+  if (!iso) return 'не проверялось';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return 'не проверялось';
+  const h = Math.floor(ms / 3600_000);
+  if (h < 24) return `${h} ч назад`;
+  return `${Math.floor(h / 24)} дн назад`;
 }
 
 const reports = { summary, queries, indexing, diagnostics };
