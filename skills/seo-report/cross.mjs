@@ -39,10 +39,18 @@
  *   node cross.mjs                 # топ-50, свежее окно Вебмастера
  *   node cross.mjs --days 14       # окно 14 дн (конец сдвинут на -2 дня)
  *   node cross.mjs --limit 100 --order position
+ *   node cross.mjs --diff          # + diff с предыдущим снимком (см. ниже)
+ *   node cross.mjs --no-save       # не сохранять снимок этого прогона
+ *   node cross.mjs --no-filter     # выключить спам-фильтр запросов
+ *
+ * Снимок: каждый прогон сохраняет JSON-снимок в .seo-snapshots/<host>/<ts>.json
+ * (директорию можно сменить через SEO_SNAPSHOT_DIR). --diff показывает, что
+ * изменилось с прошлого снимка: позиции, ИКС, состав запросов в индексе,
+ * статус диагностики. Папку .seo-snapshots/ имеет смысл добавить в .gitignore.
  */
 
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { resolve, join, dirname } from 'node:path';
 
 // --- .env из корня текущего проекта (без зависимостей) ---
 function loadEnv() {
@@ -84,6 +92,11 @@ const daysExplicit = args.includes('--days');
 const limit = parseInt(getArg('limit', '50'), 10);
 const order = getArg('order', 'shows'); // shows|clicks|position|ctr|demand|visits
 const noFilter = args.includes('--no-filter'); // выключить эвристику накрутки
+const doDiff = args.includes('--diff');       // показать diff против предыдущего снимка
+const noSave = args.includes('--no-save');    // не сохранять снимок этого прогона
+const SNAPSHOT_DIR = process.env.SEO_SNAPSHOT_DIR || '.seo-snapshots';
+// Порог дельты позиции, ниже которого изменение считается шумом (округление API).
+const DIFF_POS_THRESHOLD = 1.0;
 
 // Пороги эвристик (подсветка действий). Сознательно простые — крутите под себя.
 const NEAR_TOP_MIN = 11, NEAR_TOP_MAX = 30; // «почти в топе» — дожать
@@ -185,6 +198,26 @@ async function resolveHost() {
     host = hosts.find((h) => h.host_id === mainId) || { ...host, host_id: mainId };
   }
   return { userId, host };
+}
+
+async function fetchSummary(userId, host) {
+  const s = await wmApi(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/summary`);
+  // ИКС в s.sqi; число проблем — в s.site_problems как { SEVERITY: count, ... }.
+  const probs = s.site_problems || {};
+  const issues = Object.values(probs).reduce((sum, v) => sum + (typeof v === 'number' ? v : 0), 0);
+  return { sqi: s.sqi ?? null, issues_count: issues, raw_problems: probs };
+}
+
+async function fetchDiagnostics(userId, host) {
+  // problems — это ОБЪЕКТ { TYPE_ID: { severity, state, last_state_update } },
+  // а не массив. Trailing slash в URL важен — без него API иногда отдаёт пустоту.
+  const d = await wmApi(`/user/${userId}/hosts/${encodeURIComponent(host.host_id)}/diagnostics/`);
+  return Object.entries(d.problems || {}).map(([id, p]) => ({
+    id,
+    severity: p?.severity || '?',
+    state: p?.state || '?',
+    last_state_update: p?.last_state_update || null,
+  }));
 }
 
 async function fetchWmQueries(userId, host) {
@@ -292,6 +325,119 @@ async function fetchDemand(phrases) {
   return map;
 }
 
+// ─── Snapshot / diff ─────────────────────────────────────────────────────────
+// На каждом прогоне сохраняем JSON-снимок: queries (clean+spam), summary, диа-
+// гностика, метаданные. Это превращает срез «сейчас» в трекер во времени без
+// какой-либо БД — git-friendly, локально, бесплатно. --diff сравнивает с
+// последним предыдущим снимком (если есть) и печатает дельту.
+// Папку .seo-snapshots/ имеет смысл добавить в .gitignore.
+
+function hostSlug(hostName) {
+  return (hostName || 'unknown')
+    .replace(/^https?:\/\//, '')
+    .replace(/\/$/, '')
+    .replace(/[^\p{L}\p{N}.-]+/gu, '_');
+}
+
+function snapshotFile(hostName) {
+  const slug = hostSlug(hostName);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
+  return resolve(process.cwd(), SNAPSHOT_DIR, slug, `${ts}.json`);
+}
+
+function loadLatestSnapshot(hostName) {
+  try {
+    const dir = resolve(process.cwd(), SNAPSHOT_DIR, hostSlug(hostName));
+    const files = readdirSync(dir).filter((f) => f.endsWith('.json')).sort();
+    if (!files.length) return null;
+    const file = files[files.length - 1];
+    return { file, data: JSON.parse(readFileSync(join(dir, file), 'utf8')) };
+  } catch { return null; }
+}
+
+function saveSnapshot(file, snap) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify(snap, null, 2));
+}
+
+// Вычисляем diff между двумя снимками: ИКС, диагностика, позиции запросов.
+function computeDiff(prev, curr) {
+  const out = { sqi: null, indexed: null, queries: { up: [], down: [], new: [], gone: [] }, diagnostics: { resolved: [], new: [] } };
+
+  // ИКС
+  if (prev.summary?.sqi != null && curr.summary?.sqi != null && prev.summary.sqi !== curr.summary.sqi) {
+    out.sqi = { from: prev.summary.sqi, to: curr.summary.sqi, delta: curr.summary.sqi - prev.summary.sqi };
+  }
+
+  // Запросы: матчим по нормализованному ключу.
+  const allPrev = [...(prev.queries || []), ...(prev.spam_queries || [])];
+  const allCurr = [...(curr.queries || []), ...(curr.spam_queries || [])];
+  const prevMap = new Map(allPrev.map((q) => [q.key, q]));
+  const currMap = new Map(allCurr.map((q) => [q.key, q]));
+
+  for (const [key, c] of currMap) {
+    const p = prevMap.get(key);
+    if (!p) { out.queries.new.push(c); continue; }
+    if (p.pos != null && c.pos != null) {
+      const delta = p.pos - c.pos; // позитивно = поднялись (меньше число = лучше)
+      if (Math.abs(delta) >= DIFF_POS_THRESHOLD) {
+        (delta > 0 ? out.queries.up : out.queries.down).push({ ...c, prev_pos: p.pos, delta });
+      }
+    }
+  }
+  for (const [key, p] of prevMap) if (!currMap.has(key)) out.queries.gone.push(p);
+
+  // Диагностика (учитываем только активные проблемы PRESENT).
+  const prevD = new Set((prev.diagnostics || []).filter((d) => d.state === 'PRESENT').map((d) => d.id));
+  const currD = new Set((curr.diagnostics || []).filter((d) => d.state === 'PRESENT').map((d) => d.id));
+  for (const id of currD) if (!prevD.has(id)) out.diagnostics.new.push(id);
+  for (const id of prevD) if (!currD.has(id)) out.diagnostics.resolved.push(id);
+
+  return out;
+}
+
+function printDiff(d, prevFile, prevTakenAt) {
+  const since = prevTakenAt?.slice(0, 10) || prevFile.slice(0, 10);
+  section(`📊 Изменения с прошлого снимка (${since})`);
+
+  const hasAny = d.sqi || d.diagnostics.resolved.length || d.diagnostics.new.length
+    || d.queries.up.length || d.queries.down.length || d.queries.new.length || d.queries.gone.length;
+  if (!hasAny) { console.log('  Ничего значимого не изменилось.'); return; }
+
+  if (d.sqi) {
+    const arrow = d.sqi.delta > 0 ? '📈' : '📉';
+    console.log(`  ${arrow} ИКС: ${d.sqi.from} → ${d.sqi.to} (${d.sqi.delta > 0 ? '+' : ''}${d.sqi.delta})`);
+  }
+  if (d.diagnostics.resolved.length) {
+    console.log(`\n  ✅ Решённые проблемы:`);
+    for (const id of d.diagnostics.resolved) console.log(`    ${id}`);
+  }
+  if (d.diagnostics.new.length) {
+    console.log(`\n  🚨 Новые проблемы:`);
+    for (const id of d.diagnostics.new) console.log(`    ${id}`);
+  }
+  if (d.queries.up.length) {
+    const top = [...d.queries.up].sort((a, b) => b.delta - a.delta).slice(0, 7);
+    console.log(`\n  📈 Поднялись в выдаче:`);
+    for (const q of top) console.log(`    ${q.text.slice(0, 40).padEnd(40)} поз ${q.prev_pos.toFixed(1)} → ${q.pos.toFixed(1)} (+${q.delta.toFixed(1)})`);
+  }
+  if (d.queries.down.length) {
+    const top = [...d.queries.down].sort((a, b) => a.delta - b.delta).slice(0, 7);
+    console.log(`\n  📉 Упали в выдаче:`);
+    for (const q of top) console.log(`    ${q.text.slice(0, 40).padEnd(40)} поз ${q.prev_pos.toFixed(1)} → ${q.pos.toFixed(1)} (${q.delta.toFixed(1)})`);
+  }
+  if (d.queries.new.length) {
+    const top = [...d.queries.new].sort((a, b) => (b.shows || 0) - (a.shows || 0)).slice(0, 7);
+    console.log(`\n  🆕 Новые в индексе (топ-${top.length} по показам):`);
+    for (const q of top) console.log(`    ${q.text.slice(0, 40).padEnd(40)} показы ${num(q.shows || 0)}  поз ${q.pos != null ? q.pos.toFixed(1) : '—'}`);
+  }
+  if (d.queries.gone.length) {
+    const top = [...d.queries.gone].slice(0, 7);
+    console.log(`\n  👋 Выпали из индекса:`);
+    for (const q of top) console.log(`    ${q.text.slice(0, 40).padEnd(40)} (было: поз ${q.pos != null ? q.pos.toFixed(1) : '—'})`);
+  }
+}
+
 // ─── Сборка ──────────────────────────────────────────────────────────────────
 function sortRows(rows) {
   if (order === 'demand') return rows.sort((a, b) => (b.demand ?? -1) - (a.demand ?? -1));
@@ -318,6 +464,14 @@ try {
   const wsLabel = WS_MODE ? `${WS_MODE === 'cloud' ? 'Cloud, ' : ''}${regLabel}` : 'нет';
   const mtLabel = MT_MODE ? `счётчик ${MT_COUNTER}` : 'нет';
   console.log(`Host: ${hostName}  ·  Метрика: ${mtLabel}  ·  Wordstat: ${wsLabel}  ·  ${periodLabel}`);
+
+  // Summary + diagnostics — мягко, нужны для snapshot и diff. Не критично если упадут.
+  let summary = null, diagnostics = [];
+  try { summary = await fetchSummary(userId, host); } catch { /* ok, диагностика snapshot пометит null */ }
+  try { diagnostics = await fetchDiagnostics(userId, host); } catch { /* ok */ }
+
+  // Если --diff: подгрузим предыдущий снимок СРАЗУ, чтобы напечатать дельту сверху.
+  const prevSnap = doDiff ? loadLatestSnapshot(hostName) : null;
 
   let wmRows = await fetchWmQueries(userId, host);
   if (!wmRows.length) { console.log('\n  (Вебмастер не вернул запросов за период)\n'); process.exit(0); }
@@ -430,6 +584,39 @@ try {
       const pos = r.pos != null ? r.pos.toFixed(1) : '—';
       console.log(`    ${r.text.slice(0, 40).padEnd(40)} показы ${num(r.shows).padStart(5)}  клики ${num(r.clicks).padStart(3)}  поз ${pos.padStart(4)}  [${r._spamReason}]`);
     }
+  }
+
+  // Snapshot: фиксируем состояние "сейчас" (clean queries + spam + диагностика).
+  const snapshot = {
+    version: 1,
+    taken_at: new Date().toISOString(),
+    host: hostName,
+    host_id: host.host_id,
+    period: periodLabel,
+    counter: MT_MODE ? MT_COUNTER : null,
+    summary,
+    diagnostics,
+    queries: wmRows.map((r) => ({
+      key: r.key, text: r.text, shows: r.shows, clicks: r.clicks, ctr: r.ctr, pos: r.pos,
+      visits: r.visits ?? null, bounce: r.bounce ?? null, demand: r.demand ?? null,
+    })),
+    spam_queries: spamRows.map((r) => ({
+      key: r.key, text: r.text, shows: r.shows, clicks: r.clicks, ctr: r.ctr, pos: r.pos,
+      reason: r._spamReason,
+    })),
+  };
+
+  // --diff: печатаем дельту с предыдущим снимком отдельной секцией внизу.
+  if (doDiff) {
+    if (prevSnap) printDiff(computeDiff(prevSnap.data, snapshot), prevSnap.file, prevSnap.data.taken_at);
+    else { section('📊 Изменения с прошлого снимка'); console.log('  Это первый снимок для этого хоста — сравнивать не с чем. Запустите ещё раз через какое-то время.'); }
+  }
+
+  // Сохраняем (если не запрещено) — тихо, одной строкой в конце.
+  if (!noSave) {
+    const file = snapshotFile(hostName);
+    try { saveSnapshot(file, snapshot); console.log(`\n💾 снимок: ${file.replace(process.cwd() + '/', '')}`); }
+    catch (e) { console.error(`(не удалось сохранить снимок: ${e.message})`); }
   }
 
   console.log('');
