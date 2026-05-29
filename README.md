@@ -1,17 +1,27 @@
 # seo-for-ru — SEO-инструменты для рунета (Claude Code plugin)
 
-Коллекция скиллов для Claude Code под российский SEO-стек: **Яндекс.Метрика**, **Яндекс.Вебмастер** и кросс-отчёт, который их сводит. Чистый Node (≥18), без зависимостей. Токены и идентификаторы живут в `.env` проекта-сайта, не в репозитории плагина.
+Коллекция из четырёх скиллов для Claude Code: Яндекс-стек (Метрика, Вебмастер, Wordstat) + Google PageSpeed. Превращает разрозненные кабинеты в **actionable-рекомендации прямо в разговоре с Клодом** — без подписок, локально, в одном `.env`. Чистый Node ≥18, без зависимостей.
 
 ## Скиллы
 
 | Скилл | Что даёт | Источник |
 |---|---|---|
 | **yandex-metrika** | трафик, источники, поисковые системы, топ страниц входа, гео | [Stat API v1](https://yandex.ru/dev/metrika/ru/stat/) |
-| **yandex-webmaster** | поисковые запросы с позициями/показами/кликами/CTR, ИКС, индексация, диагностика | [Webmaster API v4](https://yandex.ru/dev/webmaster/) |
-| **seo-report** | кросс-отчёт `позиции × поведение × спрос`, спам-фильтр накрутки, снимки + diff во времени | Webmaster + Метрика + Wordstat |
+| **yandex-webmaster** | запросы с позициями/CTR (+ спам-фильтр накрутки), ИКС, индексация, диагностика со свежестью проверки | [Webmaster API v4](https://yandex.ru/dev/webmaster/) |
+| **seo-report** | кросс-отчёт `позиции × поведение × спрос`, спам-фильтр, **снимки + diff во времени** | Webmaster + Метрика + Wordstat |
 | **pagespeed** | скорость и Core Web Vitals (LCP/CLS/INP), Lighthouse-замечания, реальные данные Chrome UX Report | [Google PSI API](https://developers.google.com/speed/docs/insights/v5/about) |
 
 Скиллы подхватываются автоматически по смыслу запроса («покажи трафик», «позиции в выдаче», «что дожать в топ», «скорость сайта», «core web vitals», «что изменилось за неделю»).
+
+## Что отличает от Яндекс-UI и платных SaaS
+
+- **Кросс-джойн позиций × поведения × спроса по фразе** с нормализацией (`ё↔е`, регистр, пробелы) — Яндекс между Метрикой/Вебмастером/Wordstat в UI ничего сам не сводит.
+- **Бакеты-действия** вместо таблиц: 🎯 дожать в топ (по спросу), ✏️ переписать сниппет, 🚧 слабая посадочная, 💎 высокий спрос/слабая видимость.
+- **Спам-фильтр накрутки** (`top-no-clicks`, слитные опечатки, пользовательский blocklist) — реальная боль рунета, в Яндекс-UI не отсечь.
+- **Снимки + `--diff`** — каждый прогон пишет JSON-снимок в `.seo-snapshots/<домен>/`. История позиций / ИКС / диагностики без какой-либо БД, git-friendly.
+- **Свежесть диагностики**: `[PRESENT, 10 дн назад]` vs `[UNDEFINED, не проверялось]` — отличает реальные проблемы от устаревших и непроверенных.
+- **Мягкая деградация**: оси Метрика/Wordstat best-effort, при отказе колонки `·` и бакет скрыт — остальное работает.
+- **AI-нативный workflow**: Клод сам триггерит скилл по теме, видит вывод, рассуждает дальше — не нужно копаться между тремя вкладками Яндекса.
 
 ## Установка
 
@@ -41,15 +51,24 @@ METRIKA_COUNTER_ID=12345678     # ID счётчика
 YANDEX_WEBMASTER_TOKEN=y0_...   # OAuth, scope webmaster:read (fallback: YANDEX_OAUTH_TOKEN)
 WEBMASTER_HOST=рк-тек.рф        # если в Вебмастере несколько сайтов
 
-# Wordstat для seo-report — один из двух вариантов доступа (опционально):
-YANDEX_WORDSTAT_TOKEN=y0_...           # A: прямой Wordstat API (OAuth)
+# Wordstat для seo-report (опционально — добавляет ось спроса).
+# Cloud Search API стал ПЛАТНЫМ с 18 мая 2026 (20 ₽/1000 запросов GetTop,
+# 1 прогон cross.mjs ≈ 1.3 ₽). У новых юзеров Yandex Cloud обычно тестовый
+# грант ~4000 ₽ на 60 дней — этого хватит на ~3000 прогонов.
+# Один из двух наборов (скрипт выберет первый доступный):
+YANDEX_WORDSTAT_TOKEN=y0_...           # A: прямой Wordstat API (OAuth, форма разблокировки на wordstat.yandex.ru)
 # или
-YANDEX_CLOUD_API_KEY=AQVN...           # B: Yandex Cloud Search API (ключ AI Studio)
-YANDEX_CLOUD_FOLDER_ID=b1g...          #    + id каталога Cloud
+YANDEX_CLOUD_API_KEY=AQVN...           # B: Yandex Cloud Search API (API-ключ AI Studio со scope yc.search-api.execute)
+YANDEX_CLOUD_FOLDER_ID=b1g...          #    + id каталога Cloud; нужен биллинг + роль search-api.webSearch.user
 WORDSTAT_REGIONS=11                    # id регионов (11=Рязань, 213=Москва); пусто = вся Россия
 
-# PageSpeed Insights (опционально — поднимает rate-limit от общего no-key пула)
-PAGESPEED_API_KEY=AIza...              # бесплатный ключ из Google Cloud Console
+# Спам-фильтр и снимки seo-report (всё опционально, дефолты разумные)
+SEO_BLOCKLIST=skupik|казино|порн       # regex для сайт-специфичной накрутки (см. spam-filter в SKILL.md)
+SEO_SNAPSHOT_DIR=.seo-snapshots        # куда писать снимки cross.mjs (для --diff)
+
+# PageSpeed Insights — крайне рекомендуется свой ключ
+# (общий no-key пул периодически выжигается, ловите 429 «Quota exceeded»):
+PAGESPEED_API_KEY=AIza...              # бесплатно, 25k запросов/день, см. skills/pagespeed/SKILL.md
 ```
 
 Удобно перевыпустить **один** `YANDEX_OAUTH_TOKEN` со scope `metrika:read` + `webmaster:read` — он подхватится как fallback для Метрики и Вебмастера.
@@ -91,10 +110,12 @@ seo-for-ru/
 ├── skills/
 │   ├── yandex-metrika/     # metrika.mjs + SKILL.md
 │   ├── yandex-webmaster/   # webmaster.mjs + SKILL.md (+ PLAN.md)
-│   ├── seo-report/         # cross.mjs + SKILL.md (трекинг во времени в .seo-snapshots/)
+│   ├── seo-report/         # cross.mjs + SKILL.md
 │   └── pagespeed/          # pagespeed.mjs + SKILL.md
 └── README.md
 ```
+
+Снимки `seo-report` пишутся в `.seo-snapshots/<домен>/<timestamp>.json` **в директории проекта-сайта** (cwd при запуске), не в репозитории плагина. Если не хотите коммитить историю прогонов — добавьте `.seo-snapshots/` в `.gitignore` проекта.
 
 ## Лицензия
 
