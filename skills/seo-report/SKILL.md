@@ -49,8 +49,8 @@ WORDSTAT_REGIONS=11                  # id регионов (11=Рязань, 213
 
 Wordstat доступен двумя дверями, скрипт выберет первый доступный набор кредов:
 
-- **A — прямой Wordstat API** (`api.wordstat.yandex.net`): OAuth `Bearer`-токен. Заполнить форму разблокировки внизу [wordstat.yandex.ru](https://wordstat.yandex.ru) (~день на аппрув), потом OAuth-флоу. Лимит 10/с, 1000/день.
-- **B — Yandex Cloud Search API** (`searchapi.api.cloud.yandex.net/v2`, Preview, платный): API-ключ AI Studio + folderId. Удобнее, если уже есть аккаунт Cloud. Требует роль `search-api.webSearch.user` сервисному аккаунту ключа и активный биллинг.
+- **A — прямой Wordstat API** (`api.wordstat.yandex.net`): OAuth `Bearer`-токен. Заполнить форму разблокировки внизу [wordstat.yandex.ru](https://wordstat.yandex.ru) (~день на аппрув), потом OAuth-флоу. Исторически бесплатный, лимит 10/с, 1000/день. С появлением платности Cloud-варианта **скорее всего тоже тарифицируется** — проверьте у Яндекса актуальный статус перед использованием.
+- **B — Yandex Cloud Search API** (`searchapi.api.cloud.yandex.net/v2`): API-ключ AI Studio (`Api-Key`) + folderId. **Платный с 18 мая 2026** — см. [тарификация](https://aistudio.yandex.ru/docs/ru/search-api/pricing.html). Текущая цена `GetTop`: **20 ₽ / 1000 запросов** (с НДС). Один прогон cross.mjs ≈ 65 запросов ≈ 1.3 ₽. Требует на облаке: (1) роль `search-api.webSearch.user` сервисному аккаунту ключа, (2) **активный биллинг-аккаунт** (без него 403 PERMISSION_DENIED даже с правильной ролью), (3) у новых пользователей Cloud обычно есть тестовый грант ~4000 ₽ на 60 дней — хватает на тысячи прогонов.
 
 ## Запуск
 
