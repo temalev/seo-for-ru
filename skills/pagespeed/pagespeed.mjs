@@ -34,15 +34,22 @@ const API = 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed';
 const API_KEY = process.env.PAGESPEED_API_KEY || '';
 
 const args = process.argv.slice(2);
-const url = args.find((a) => !a.startsWith('--') && /^https?:\/\//i.test(a));
+const rawUrl = args.find((a) => !a.startsWith('--') && /^https?:\/\//i.test(a));
 const getArg = (n, d) => { const i = args.indexOf(`--${n}`); return i !== -1 && args[i + 1] ? args[i + 1] : d; };
 const strategyArg = getArg('strategy', 'both'); // mobile|desktop|both
 
-if (!url) {
+if (!rawUrl) {
   console.error('❌ Укажите URL: node pagespeed.mjs https://example.com/');
   console.error('   Опции: --strategy mobile|desktop|both (дефолт both)');
   process.exit(1);
 }
+
+// IDN→ASCII (punycode): Lighthouse в Google не умеет кириллические домены и
+// падает с 'INVALID_URL'. URL-конструктор Node автоматически конвертит
+// hostname в punycode, .href отдаёт ASCII-форму.
+let url;
+try { url = new URL(rawUrl).href; }
+catch { console.error(`❌ Невалидный URL: ${rawUrl}`); process.exit(1); }
 
 async function fetchPSI(strategy) {
   const u = new URL(API);
