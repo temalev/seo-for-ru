@@ -256,7 +256,8 @@ async function wsTopRequests(phrase, retried = false) {
     url = WS_CLOUD_API;
     headers = { Authorization: `Api-Key ${YC_KEY}`, 'Content-Type': 'application/json' };
     body = { phrase, numPhrases: 1, folderId: YC_FOLDER };
-    if (WS_REGIONS.length) body.regions = WS_REGIONS;
+    // Cloud Search API ждёт regions как строки (TYPE_STRING), не числа.
+    if (WS_REGIONS.length) body.regions = WS_REGIONS.map(String);
   } else {
     url = WS_OAUTH_API;
     headers = { Authorization: `Bearer ${WS_OAUTH}`, 'Content-Type': 'application/json; charset=utf-8' };
